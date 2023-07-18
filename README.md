@@ -1,5 +1,11 @@
 # My_AutoHotKey_Bindings
 
+```FYI: 
+# = Win
++ = Shift
+! = Alt
+^ = Ctrl
+```
 
 File Name | Use | Keys
 ---:|:---:|:---
