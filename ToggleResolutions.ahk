@@ -1,9 +1,12 @@
 #Requires AutoHotkey v2.0
 
 ; ==============================================================================
-; WINDOWS DISPLAY RESOLUTION TOGGLE SCRIPT (AHK v2)
+; WINDOWS DISPLAY RESOLUTION & PROCESS AUTOMATION SCRIPT (AHK v2)
 ; Description: Toggles between two specific display resolutions, automatically 
 ;              finding and applying the highest available refresh rate for each.
+;              Features background process monitoring to automatically scale 
+;              resolution when specific apps launch, and restores native parameters
+;              with a smart debounce delay when they close.
 ;              Specifically handles iGPU scaling issues (like "Center" scaling)
 ;              by forcing fullscreen stretching and registry updates.
 ; My usecase: I can toggle betwween the resolutions with one button. Reducing the 
@@ -17,6 +20,9 @@ if !A_IsAdmin {
     Run('*RunAs "' A_ScriptFullPath '"')
     ExitApp()
 }
+
+; Enable Regular Expressions for highly flexible process matching in the array
+SetTitleMatchMode("RegEx")
 
 ; ==============================================================================
 ; USER CONFIGURATION
@@ -32,26 +38,55 @@ PrimaryH := 1600
 SecondaryW := 1920
 SecondaryH := 1080
 
+; --- Process Automation Settings ---
+; Target executables to monitor. Backslash escapes literal dots for RegEx safety.
+; List of processes (RegEx enabled). 
+TargetProcesses := ["TargetGame\.exe", "AppEngine"] 
+
+; --- Timing & Debounce Parameters ---
+CheckInterval := 3000   ; Scanner frequency: Evaluates process list every 3 seconds
+RevertDelay   := 15000  ; Hysteresis buffer: Delays recovery by 15 seconds to prevent flicker
+
+; ==============================================================================
+; STATE MACHINE GLOBALS
+; ==============================================================================
+
+global isSecondary          := false ; Active resolution status
+global autoTriggered        := false ; True if the script initiated the switch automatically
+global manualOverride       := false ; True if the user engaged manual control
+global lastSeenTime         := 0     ; Timestamp tracking when a process was last visible
+global lastTriggeredProcess := ""    ; Caches the exact executable string for dynamic tooltips
+
+; Initialize persistent background monitoring loop
+SetTimer(MonitorProcesses, CheckInterval)
+
 ; ==============================================================================
 ; HOTKEYS
 ; ==============================================================================
 
 ; Win + Alt + S: The main toggle switch
 #!s:: {
-    static isSecondary := false
-    SoundBeep(750, 200) ; Auditory feedback that the keypress registered
+    global isSecondary, manualOverride, autoTriggered, lastTriggeredProcess
+    
+    SoundBeep(750, 200) ; Auditory confirmation
     
     if !isSecondary {
-        ; Attempt to apply the secondary resolution
         if ApplyResolution(SecondaryW, SecondaryH) {
-            isSecondary := true
+            isSecondary          := true
+            manualOverride       := true  ; Engage manual lock to pause automation scans
+            autoTriggered        := false 
+            lastTriggeredProcess := "Manual Override"
+            TrayTip("Display Scaled", "Manually switched to " SecondaryW "x" SecondaryH)
         } else {
             MsgBox("Failed to set " SecondaryW "x" SecondaryH ".")
         }
     } else {
-        ; Revert to the primary/native resolution
         if ApplyResolution(PrimaryW, PrimaryH) {
-            isSecondary := false
+            isSecondary          := false
+            manualOverride       := true  ; Retain manual lock to prevent immediate auto-triggering
+            autoTriggered        := false
+            lastTriggeredProcess := ""
+            TrayTip("Display Restored", "Manually reverted to native " PrimaryW "x" PrimaryH)
         } else {
             MsgBox("Failed to revert to " PrimaryW "x" PrimaryH ".")
         }
@@ -61,15 +96,90 @@ SecondaryH := 1080
 ; Win + Alt + 0: The "Panic Button" Emergency Reset
 ; Bypasses the script's logic and tells Windows to reload its default hardware state.
 #!0:: {
-    global isSecondary
-    ; Explicitly force the native resolution instead of relying on the registry
+    global isSecondary, manualOverride, autoTriggered, lastTriggeredProcess
+    
+    ; Explicitly force native targets to bypass broken registry defaults
     if ApplyResolution(PrimaryW, PrimaryH) {
-        isSecondary := false ; Reset the toggle state
+        isSecondary          := false
+        manualOverride       := true  ; Lock logic engine to stabilize recovery
+        autoTriggered        := false
+        lastTriggeredProcess := ""
         SoundBeep(400, 500)
+        TrayTip("Panic Button Activated", "Display forced to native parameters. Automation paused.")
     } else {
         MsgBox("Panic Button failed to force " PrimaryW "x" PrimaryH ".")
     }
 }
+
+
+; ==============================================================================
+; AUTOMATION ENGINE (PROCESS MONITORING & HYSTERESIS)
+; ==============================================================================
+
+MonitorProcesses() {
+    global isSecondary, autoTriggered, manualOverride, lastSeenTime, lastTriggeredProcess
+    
+    ; Immediately halt monitoring execution if explicit manual control is active
+    if manualOverride 
+        return
+
+    processFound := false
+    currentProcessName := ""
+    
+    ; Scan active window contexts against the configured RegEx array
+    for processPattern in TargetProcesses {
+        if WinExist("ahk_exe i)" . processPattern) {
+            processFound := true
+            ; Capture exact literal executable string from OS memory matrices
+            currentProcessName := WinGetProcessName() 
+            break
+        }
+    }
+
+    ; --- Smart Re-Arming Logic ---
+    ; If the user forced an override while an app ran, keep automation asleep 
+    ; until the app fully closes. Once clear, gracefully lift the block.
+    if (manualOverride) {
+        if (!processFound) {
+            manualOverride := false 
+            TrayTip("Automation Re-Armed", "Monitoring initialized for subsequent execution.")
+        }
+        return
+    }
+
+    ; --- Primary Automation Handling ---
+    if (processFound) {
+        lastSeenTime := A_TickCount ; Continuously update active validation tick
+        
+        if (!isSecondary) {
+            lastTriggeredProcess := currentProcessName
+            
+            if ApplyResolution(SecondaryW, SecondaryH) {
+                isSecondary   := true
+                autoTriggered := true
+                TrayTip("Process Launched: " . lastTriggeredProcess, "Scaled to " SecondaryW "x" SecondaryH " for optimal output.")
+            }
+        }
+    } 
+    ; --- Automated Recovery (Debouncing Phase) ---
+    else if (!processFound && isSecondary && autoTriggered) {
+        
+        ; Verify elapsed continuous absence exceeds configured hysteresis limits
+        if ((A_TickCount - lastSeenTime) >= RevertDelay) {
+            
+            closedProcess := lastTriggeredProcess != "" ? lastTriggeredProcess : "Target application"
+            
+            if ApplyResolution(PrimaryW, PrimaryH) {
+                isSecondary          := false
+                autoTriggered        := false
+                lastTriggeredProcess := ""
+                TrayTip("Session Ended: " . closedProcess, "Restored native resolution (" PrimaryW "x" PrimaryH ").")
+            }
+        }
+    }
+}
+
+
 
 ; ==============================================================================
 ; CORE FUNCTIONS & WIN32 API LOGIC
