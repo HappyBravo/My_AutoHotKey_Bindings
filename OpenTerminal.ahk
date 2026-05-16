@@ -1,32 +1,16 @@
-﻿SwitchToWindowsTerminal()
+﻿#Requires AutoHotkey v2
+
+^!t::
 {
-  windowHandleId := WinExist("ahk_exe WindowsTerminal.exe")
-  windowExistsAlready := windowHandleId > 0
+    hwnd := WinExist("ahk_exe WindowsTerminal.exe")
 
-  ; If the Windows Terminal is already open, determine if we should put it in focus or minimize it.
-  if (windowExistsAlready = true)
-  {
-    activeWindowHandleId := WinExist("A")
-    windowIsAlreadyActive := activeWindowHandleId == windowHandleId
-
-    if (windowIsAlreadyActive)
-    {
-      ; Minimize the window.
-      WinMinimize, "ahk_id %windowHandleId%"
-    }
+    if !hwnd
+        Run("wt")
+    else if WinActive("ahk_id " hwnd)
+        WinMinimize("ahk_id " hwnd)
     else
     {
-      ; Put the window in focus.
-      WinActivate, "ahk_id %windowHandleId%"
-      WinShow, "ahk_id %windowHandleId%"
+        WinRestore("ahk_id " hwnd)
+        WinActivate("ahk_id " hwnd)
     }
-  }
-  ; Else it's not already open, so launch it.
-  else
-  {
-    Run, wt
-  }
 }
-
-; Hotkey to use Ctrl+Alt+T to launch/restore the Windows Terminal.
-^!t::SwitchToWindowsTerminal()

@@ -1,11 +1,22 @@
-;Press F12 to hide or unhide desktop icons
-;F12::
+#Requires AutoHotKey v2
+
+; Ctrl+Alt+H to hide/unhide desktop icons
 ^!h::
-ControlGet, HWND, Hwnd,, SysListView321, ahk_class Progman
-If HWND =
-ControlGet, HWND, Hwnd,, SysListView321, ahk_class WorkerW
-If DllCall("IsWindowVisible", UInt, HWND)
-WinHide, ahk_id %HWND%
-Else
-WinShow, ahk_id %HWND%
-Return
+{
+    hwnd := GetDesktopIconsHwnd()
+
+    if hwnd
+        DllCall("ShowWindow", "Ptr", hwnd, "Int"
+            , DllCall("IsWindowVisible", "Ptr", hwnd) ? 0 : 5)
+}
+
+GetDesktopIconsHwnd()
+{
+    for className in ["Progman", "WorkerW"]
+    {
+        try
+            return ControlGetHwnd("SysListView321", "ahk_class " className)
+    }
+
+    return 0
+}
