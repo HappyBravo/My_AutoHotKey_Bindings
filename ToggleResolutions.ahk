@@ -21,7 +21,6 @@ if !A_IsAdmin {
     ExitApp()
 }
 
-; Enable Regular Expressions for highly flexible process matching in the array
 SetTitleMatchMode("RegEx")
 
 ; ==============================================================================
@@ -29,8 +28,6 @@ SetTitleMatchMode("RegEx")
 ; Put your native resolutions here <<< -------- [ ‼️ IMPORTANT ‼️]
 ; Define your target resolutions here. 
 ; ==============================================================================
-
-; Primary / Native Resolution (e.g., 2560x1600 for 16:10 displays)
 PrimaryW := 2560 
 PrimaryH := 1600
 
@@ -38,26 +35,40 @@ PrimaryH := 1600
 SecondaryW := 1920
 SecondaryH := 1080
 
-; --- Process Automation Settings ---
-; Target executables to monitor. Backslash escapes literal dots for RegEx safety.
-; List of processes (RegEx enabled). 
-TargetProcesses := ["TargetGame\.exe", "AppEngine"] 
+; Array of executables (RegEx enabled). 
+; TargetProcesses := ["TargetGame\.exe", "AppEngine"] 
+TargetProcesses := ["HTGame\.exe", "NTEGlobal"]
 
-; --- Timing & Debounce Parameters ---
-CheckInterval := 3000   ; Scanner frequency: Evaluates process list every 3 seconds
-RevertDelay   := 15000  ; Hysteresis buffer: Delays recovery by 15 seconds to prevent flicker
+CheckInterval := 3000   ; 3 seconds
+RevertDelay   := 15000  ; 15 seconds
 
 ; ==============================================================================
-; STATE MACHINE GLOBALS
+; PRE-COMPUTATION & CACHING (THE MAJOR OPTIMIZATION)
 ; ==============================================================================
+; Combine array into a single fast RegEx string: e.g., "(TargetGame\.exe|AppEngine)"
+global CombinedRegex := "(" 
+for idx, proc in TargetProcesses {
+    CombinedRegex .= proc . (idx = TargetProcesses.Length ? ")" : "|")
+}
 
-global isSecondary          := false ; Active resolution status
-global autoTriggered        := false ; True if the script initiated the switch automatically
-global manualOverride       := false ; True if the user engaged manual control
-global lastSeenTime         := 0     ; Timestamp tracking when a process was last visible
-global lastTriggeredProcess := ""    ; Caches the exact executable string for dynamic tooltips
+; Pre-calculate and cache the DEVMODE memory buffers for instant switching
+global PrimaryModeBuffer   := CacheDisplayMode(PrimaryW, PrimaryH)
+global SecondaryModeBuffer := CacheDisplayMode(SecondaryW, SecondaryH)
 
-; Initialize persistent background monitoring loop
+if (!PrimaryModeBuffer || !SecondaryModeBuffer) {
+    MsgBox("CRITICAL ERROR: Could not find valid display modes for your specified resolutions.`nCheck your width/height settings.")
+    ExitApp()
+}
+
+; ==============================================================================
+; STATE GLOBALS & STARTUP
+; ==============================================================================
+global isSecondary          := false 
+global autoTriggered        := false 
+global manualOverride       := false 
+global lastSeenTime         := 0     
+global lastTriggeredProcess := ""    
+
 SetTimer(MonitorProcesses, CheckInterval)
 
 ; ==============================================================================
@@ -67,28 +78,23 @@ SetTimer(MonitorProcesses, CheckInterval)
 ; Win + Alt + S: The main toggle switch
 #!s:: {
     global isSecondary, manualOverride, autoTriggered, lastTriggeredProcess
-    
-    SoundBeep(750, 200) ; Auditory confirmation
+    SoundBeep(750, 200) 
     
     if !isSecondary {
-        if ApplyResolution(SecondaryW, SecondaryH) {
+        if ApplyCachedResolution(SecondaryModeBuffer) {
             isSecondary          := true
-            manualOverride       := true  ; Engage manual lock to pause automation scans
+            manualOverride       := true  
             autoTriggered        := false 
             lastTriggeredProcess := "Manual Override"
             TrayTip("Display Scaled", "Manually switched to " SecondaryW "x" SecondaryH)
-        } else {
-            MsgBox("Failed to set " SecondaryW "x" SecondaryH ".")
         }
     } else {
-        if ApplyResolution(PrimaryW, PrimaryH) {
+        if ApplyCachedResolution(PrimaryModeBuffer) {
             isSecondary          := false
-            manualOverride       := true  ; Retain manual lock to prevent immediate auto-triggering
+            manualOverride       := true  
             autoTriggered        := false
             lastTriggeredProcess := ""
             TrayTip("Display Restored", "Manually reverted to native " PrimaryW "x" PrimaryH)
-        } else {
-            MsgBox("Failed to revert to " PrimaryW "x" PrimaryH ".")
         }
     }
 }
@@ -97,23 +103,18 @@ SetTimer(MonitorProcesses, CheckInterval)
 ; Bypasses the script's logic and tells Windows to reload its default hardware state.
 #!0:: {
     global isSecondary, manualOverride, autoTriggered, lastTriggeredProcess
-    
-    ; Explicitly force native targets to bypass broken registry defaults
-    if ApplyResolution(PrimaryW, PrimaryH) {
+    if ApplyCachedResolution(PrimaryModeBuffer) {
         isSecondary          := false
-        manualOverride       := true  ; Lock logic engine to stabilize recovery
+        manualOverride       := true  
         autoTriggered        := false
         lastTriggeredProcess := ""
         SoundBeep(400, 500)
-        TrayTip("Panic Button Activated", "Display forced to native parameters. Automation paused.")
-    } else {
-        MsgBox("Panic Button failed to force " PrimaryW "x" PrimaryH ".")
+        TrayTip("Panic Button Activated", "Display forced to native parameters.")
     }
 }
 
-
 ; ==============================================================================
-; AUTOMATION ENGINE (PROCESS MONITORING & HYSTERESIS)
+; AUTOMATION ENGINE
 ; ==============================================================================
 
 MonitorProcesses() {
@@ -123,72 +124,62 @@ MonitorProcesses() {
     if manualOverride 
         return
 
-    processFound := false
-    currentProcessName := ""
-    
-    ; Scan active window contexts against the configured RegEx array
-    for processPattern in TargetProcesses {
-        if WinExist("ahk_exe i)" . processPattern) {
-            processFound := true
-            ; Capture exact literal executable string from OS memory matrices
-            currentProcessName := WinGetProcessName() 
-            break
-        }
+    ; --- Smart Idle Check ---
+    ; If AFK for 3 minutes, slow polling to 10 seconds to save CPU
+    if (A_TimeIdlePhysical > 180000) {
+        SetTimer(, 10000)
+        return
+    } else {
+        SetTimer(, CheckInterval) ; Restore normal speed when active
     }
 
-    ; --- Smart Re-Arming Logic ---
-    ; If the user forced an override while an app ran, keep automation asleep 
-    ; until the app fully closes. Once clear, gracefully lift the block.
+    ; --- Fast Regex Window Check ---
+    ; Evaluates all target games simultaneously in a single Win32 API call
+    targetHwnd := WinExist("ahk_exe i)" . CombinedRegex)
+    processFound := (targetHwnd != 0)
+    
     if (manualOverride) {
         if (!processFound) {
             manualOverride := false 
-            TrayTip("Automation Re-Armed", "Monitoring initialized for subsequent execution.")
+            TrayTip("Automation Re-Armed", "Monitoring initialized.")
         }
         return
     }
 
     ; --- Primary Automation Handling ---
     if (processFound) {
-        lastSeenTime := A_TickCount ; Continuously update active validation tick
+        lastSeenTime := A_TickCount 
         
         if (!isSecondary) {
-            lastTriggeredProcess := currentProcessName
+            lastTriggeredProcess := WinGetProcessName("ahk_id " targetHwnd)
             
-            if ApplyResolution(SecondaryW, SecondaryH) {
+            if ApplyCachedResolution(SecondaryModeBuffer) {
                 isSecondary   := true
                 autoTriggered := true
-                TrayTip("Process Launched: " . lastTriggeredProcess, "Scaled to " SecondaryW "x" SecondaryH " for optimal output.")
+                TrayTip("Process Launched: " . lastTriggeredProcess, "Scaled to " SecondaryW "x" SecondaryH)
             }
         }
     } 
-    ; --- Automated Recovery (Debouncing Phase) ---
     else if (!processFound && isSecondary && autoTriggered) {
-        
-        ; Verify elapsed continuous absence exceeds configured hysteresis limits
         if ((A_TickCount - lastSeenTime) >= RevertDelay) {
-            
             closedProcess := lastTriggeredProcess != "" ? lastTriggeredProcess : "Target application"
             
-            if ApplyResolution(PrimaryW, PrimaryH) {
+            if ApplyCachedResolution(PrimaryModeBuffer) {
                 isSecondary          := false
                 autoTriggered        := false
                 lastTriggeredProcess := ""
-                TrayTip("Session Ended: " . closedProcess, "Restored native resolution (" PrimaryW "x" PrimaryH ").")
+                TrayTip("Session Ended: " . closedProcess, "Restored native resolution.")
             }
         }
     }
 }
 
-
-
 ; ==============================================================================
 ; CORE FUNCTIONS & WIN32 API LOGIC
 ; ==============================================================================
 
-ApplyResolution(w, h) {
-    ; Windows requires display data to be passed in a specific C-style struct 
-    ; called DEVMODE (Device Mode). For modern Windows, its size is 220 bytes.
-    ; AHK's 'Buffer' creates this chunk of memory.
+; Runs ONLY on script startup. Finds the highest Hz for a resolution and saves the memory block.
+CacheDisplayMode(w, h) {
     devMode := Buffer(220, 0)
     
     ; NumPut writes data to specific byte offsets within our buffer.
@@ -203,11 +194,9 @@ ApplyResolution(w, h) {
     ; EnumDisplaySettingsW queries the graphics driver for every supported display mode.
     ; We loop through all of them (modeNum 0, 1, 2, etc.) until the API returns 0 (false).
     while DllCall("EnumDisplaySettingsW", "Ptr", 0, "UInt", modeNum, "Ptr", devMode) {
-        
-        ; NumGet extracts data from the buffer populated by the graphics driver.
-        curW  := NumGet(devMode, 172, "UInt") ; dmPelsWidth  (Pixels wide)
-        curH  := NumGet(devMode, 176, "UInt") ; dmPelsHeight (Pixels high)
-        curHz := NumGet(devMode, 120, "UInt") ; dmDisplayFrequency (Refresh rate)
+        curW  := NumGet(devMode, 172, "UInt") 
+        curH  := NumGet(devMode, 176, "UInt") 
+        curHz := NumGet(devMode, 120, "UInt") 
         
         ; If the mode matches our target width and height...
         if (curW = w && curH = h) {
@@ -223,28 +212,25 @@ ApplyResolution(w, h) {
         }
         modeNum++
     }
-    
-    ; --- STEP 2: Apply the Resolution ---
-    if (bestModeBuffer) {
-        ; ChangeDisplaySettingsW sends our chosen DEVMODE buffer back to the driver.
-        ; 
-        ; FLAGS USED:
-        ; 0x1 (CDS_UPDATEREGISTRY): Saves the change to the Windows registry. This forces
-        ;                           Windows to remember scaling settings and prevents the 
-        ;                           change from reverting dynamically.
-        ; 0x4 (CDS_FULLSCREEN):     Instructs the driver to scale the image to fill the 
-        ;                           entire screen, overriding "Centered" iGPU behaviors 
-        ;                           that cause thick black borders.
-        
-        result := DllCall("ChangeDisplaySettingsW", "Ptr", bestModeBuffer, "UInt", 0x1 | 0x4)
-        
-        ; Return true if the API call was successful (result = 0 is DISP_CHANGE_SUCCESSFUL)
-        return (result = 0)
-    }
-    
-    ; Return false if the requested resolution was not found in the driver's list at all.
-    return false
+    return bestModeBuffer
 }
+
+; Instantly applies a pre-cached memory block. Zero calculations needed.
+ApplyCachedResolution(cachedBuffer) {
+    if (!cachedBuffer)
+        return false
+    ;
+    ; FLAGS USED:
+    ; 0x1 (CDS_UPDATEREGISTRY): Saves the change to the Windows registry. This forces
+    ;                           Windows to remember scaling settings and prevents the
+    ;                           change from reverting dynamically.
+    ; 0x4 (CDS_FULLSCREEN):     Instructs the driver to scale the image to fill the
+    ;                           entire screen, overriding "Centered" iGPU behaviors
+    ;                           that cause thick black borders.
+        
+    result := DllCall("ChangeDisplaySettingsW", "Ptr", cachedBuffer, "UInt", 0x1 | 0x4)
+    return (result = 0)
+    } 
 
 ; FOR FURTHER READING 
 ; DllCall()                      : https://www.autohotkey.com/docs/v2/lib/DllCall.htm

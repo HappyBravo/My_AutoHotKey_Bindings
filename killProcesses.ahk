@@ -6,8 +6,8 @@
 ; =========================================================
 
 if !A_IsAdmin {
-    Run '*RunAs "' A_ScriptFullPath '"'
-    ExitApp
+    Run('*RunAs "' A_ScriptFullPath '"')
+    ExitApp()
 }
 
 ; =========================================================
@@ -15,7 +15,7 @@ if !A_IsAdmin {
 ; =========================================================
 
 global ScriptEnabled := true ; ON by default
-global waitTime := 3 ; Minutes
+global baseWaitTime  := 3    ; Base check interval in minutes
 
 ^!k:: {
     global ScriptEnabled := !ScriptEnabled
@@ -23,10 +23,15 @@ global waitTime := 3 ; Minutes
     if ScriptEnabled {
         TrayTip("Background checking is now ON", "System Optimizer Resumed")
         SetTimer(() => TrayTip(), -3000)
-        CheckRules() 
+        
+        ; Kickstart the engine immediately upon unpausing
+        SetTimer(CheckRules, -1) 
     } else {
         TrayTip("Optimizer OFF. Restoring Windows Update...", "System Optimizer Paused")
         SetTimer(() => TrayTip(), -3000)
+        
+        ; Turn off the timer completely
+        SetTimer(CheckRules, 0)
         
         try {
             RunWait('sc config "UsoSvc" start= demand', , "Hide")
@@ -36,7 +41,7 @@ global waitTime := 3 ; Minutes
 }
 
 ; =========================================================
-; CONFIG RULES (ADD YOUR APPS HERE)
+; CONFIG RULES
 ; =========================================================
 ; Available Conditions:
 ; - batteryOnly: true      (Only kill if unplugged)
@@ -87,7 +92,6 @@ global waitTime := 3 ; Minutes
 ; ]
 
 global Rules := [
-
     ; 1. HARDWARE MONITORS
     {
         name: "MSI Afterburner",
@@ -97,45 +101,67 @@ global Rules := [
             notWhileGaming: true
         }
     },
-
-    ; 4. WINDOWS UPDATE (Always disable)
+    ; 2. WINDOWS UPDATE (Always disable)
     {
         name: "Windows Update Services",
         services: ["UsoSvc", "wuauserv"],
-        conditions: {} ; Empty means always apply
+        conditions: {} 
     }
 ]
 
 ; =========================================================
-; START
+; STARTUP
 ; =========================================================
 
-CheckRules()
-
-; Run every 3 minutes (180,000 milliseconds)
-SetTimer(CheckRules, waitTime * 60*1000)
-
-Persistent
+; Run the first check instantly, then the timer self-manages
+SetTimer(CheckRules, -1) 
+Persistent()
 
 ; =========================================================
 ; MAIN LOOP & LOGIC ENGINE
 ; =========================================================
 
 CheckRules() {
-    global Rules, ScriptEnabled
+    global Rules, ScriptEnabled, baseWaitTime
 
     if (!ScriptEnabled) {
         return
     }
 
+    ; -------------------------------------------------------------
+    ; OPTIMIZATION 1: IDLE & BATTERY SMART SCALING
+    ; -------------------------------------------------------------
+    baseMs := baseWaitTime * 60 * 1000
+    isPluggedIn := IsCharging()
+
+    ; If no physical input for 5 minutes, enter Deep Sleep (Check every 10 mins)
+    if (A_TimeIdlePhysical > 300000) {
+        SetTimer(, baseMs * 3.33) 
+        return ; Skip all heavy WMI and Process logic while away
+    }
+
+    ; Scale timer based on power state
+    if (isPluggedIn) {
+        SetTimer(, baseMs)       ; 3 Minutes on AC Power
+    } else {
+        SetTimer(, baseMs * 2)   ; 6 Minutes on Battery
+    }
+
+    ; -------------------------------------------------------------
+    ; OPTIMIZATION 2: CACHE SYSTEM STATE ONCE PER CYCLE
+    ; -------------------------------------------------------------
+    ; Instead of querying the screen for every rule, check it once.
+    isGaming := IsFullscreenWindowPresent()
+
+    ; -------------------------------------------------------------
+    ; RULE EVALUATION
+    ; -------------------------------------------------------------
     for rule in Rules {
 
-        ; -------------------------------------------------
-        ; PROCESS HANDLING
-        ; -------------------------------------------------
+        ; --- PROCESS HANDLING ---
         if rule.HasProp("processes") {
-
-            ; Optimization: Only check logic if the apps are actually running
+            
+            ; 1. Are any of the target processes even running?
             anyRunning := false
             for proc in rule.processes {
                 if ProcessExist(proc) {
@@ -144,34 +170,28 @@ CheckRules() {
                 }
             }
 
+            ; If not running, skip condition checks entirely
             if (!anyRunning) {
                 continue 
             }
 
-            ; Default to true, try to find a reason NOT to kill it
+            ; 2. Evaluate Conditions against our cached states
             shouldKill := true
 
             if rule.HasProp("conditions") {
+                conds := rule.conditions
                 
-                ; Condition: Must be on battery
-                if rule.conditions.HasProp("batteryOnly") && rule.conditions.batteryOnly {
-                    if IsCharging()
-                        shouldKill := false
-                }
-
-                ; Condition: Must be gaming
-                if rule.conditions.HasProp("whileGaming") && rule.conditions.whileGaming {
-                    if !IsFullscreenWindowPresent()
-                        shouldKill := false
-                }
-
-                ; Condition: Must NOT be gaming
-                if rule.conditions.HasProp("notWhileGaming") && rule.conditions.notWhileGaming {
-                    if IsFullscreenWindowPresent()
-                        shouldKill := false
-                }
+                if conds.HasProp("batteryOnly") && conds.batteryOnly && isPluggedIn
+                    shouldKill := false
+                
+                if conds.HasProp("whileGaming") && conds.whileGaming && !isGaming
+                    shouldKill := false
+                
+                if conds.HasProp("notWhileGaming") && conds.notWhileGaming && isGaming
+                    shouldKill := false
             }
 
+            ; 3. Execute
             if shouldKill {
                 for proc in rule.processes {
                     KillProcess(proc)
@@ -179,9 +199,7 @@ CheckRules() {
             }
         }
 
-        ; -------------------------------------------------
-        ; SERVICE HANDLING
-        ; -------------------------------------------------
+        ; --- SERVICE HANDLING ---
         if rule.HasProp("services") {
             for svc in rule.services {
                 DisableService(svc)
@@ -232,9 +250,9 @@ IsCharging() {
     PowerStatus := Buffer(12, 0)
     if DllCall("kernel32\GetSystemPowerStatus", "Ptr", PowerStatus) {
         acLineStatus := NumGet(PowerStatus, 0, "UChar")
-        return (acLineStatus == 1)
+        return (acLineStatus == 1) ; 1 = AC, 0 = Battery
     }
-    return true 
+    return true ; Default to true if call fails to prevent accidental kills
 }
 
 IsFullscreenWindowPresent() {
@@ -251,7 +269,7 @@ IsFullscreenWindowPresent() {
         WinGetPos(&x, &y, &w, &h, "ahk_id " activeHwnd)
 
         if (x <= 0 && y <= 0 && w >= A_ScreenWidth && h >= A_ScreenHeight) {
-            if !(style & 0x00C00000) {
+            if !(style & 0x00C00000) { ; 0x00C00000 is WS_CAPTION
                 return true
             }
         }
